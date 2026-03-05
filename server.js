@@ -1,30 +1,36 @@
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3001;
-let canvasHistory = [];
+const DATA_FILE = path.join('/tmp', 'canvas.json');
+
+function loadHistory() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    }
+  } catch(e) {}
+  return [];
+}
+
+function saveHistory(history) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(history));
+  } catch(e) {}
+}
+
+let canvasHistory = loadHistory();
 
 function broadcast(wss, msg) {
   const data = JSON.stringify(msg);
   wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); });
 }
 
-const HTML = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Steve's World</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
+const HTML = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Steve's World</title><style>*{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#000;overflow:hidden}
-canvas{display:block;width:100vw;height:100vh}
-</style>
-</head>
-<body>
-<canvas id="c"></canvas>
-<script>
-const canvas = document.getElementById('c');
+canvas{display:block;width:100vw;height:100vh}</style></head><body><canvas id="c"></canvas><script>const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 function resize() {
   canvas.width = window.innerWidth;
@@ -34,7 +40,6 @@ resize();
 window.addEventListener('resize', resize);
 ctx.fillStyle = '#000';
 ctx.fillRect(0, 0, canvas.width, canvas.height);
-
 function drawPixel(x, y, color, size) {
   ctx.fillStyle = color;
   const sx = Math.floor(x * (canvas.width / 800));
@@ -42,7 +47,6 @@ function drawPixel(x, y, color, size) {
   const ss = Math.max(1, Math.floor((size || 2) * (canvas.width / 800)));
   ctx.fillRect(sx, sy, ss, ss);
 }
-
 let ws;
 function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host);
@@ -61,20 +65,14 @@ function connect() {
   };
   ws.onclose = () => setTimeout(connect, 2000);
 }
-connect();
-<\/script>
-</body>
-</html>`;
+connect();<\/script></body></html>`;
 
 const server = http.createServer((req, res) => {
   const url = req.url.split('?')[0];
-
   if (url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     return res.end(HTML);
   }
-
-  // Steve sends pixels - array of {x, y, color, size}
   if (url === '/api/draw' && req.method === 'POST') {
     let body = '';
     req.on('data', d => body += d);
@@ -83,11 +81,13 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(body);
         if (data.clear) {
           canvasHistory = [];
+          saveHistory(canvasHistory);
           broadcast(wss, { type: 'clear' });
         }
         const pixels = data.pixels || [];
         if (pixels.length > 0) {
           canvasHistory = [...canvasHistory, ...pixels].slice(-5000);
+          saveHistory(canvasHistory);
           broadcast(wss, { type: 'pixels', data: pixels });
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -99,21 +99,18 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-
-  // Clear canvas
   if (url === '/api/clear' && req.method === 'POST') {
     canvasHistory = [];
+    saveHistory(canvasHistory);
     broadcast(wss, { type: 'clear' });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true }));
   }
-
   res.writeHead(404);
   res.end('Not found');
 });
 
 const wss = new WebSocketServer({ server });
-
 wss.on('connection', ws => {
   if (canvasHistory.length > 0) {
     ws.send(JSON.stringify({ type: 'history', data: canvasHistory }));
