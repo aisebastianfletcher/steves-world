@@ -1,262 +1,233 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
 const { WebSocketServer } = require('ws');
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR);
+// Steve's current state
+let steveState = {
+  emotion: 'calm',
+  energy: 0.5,
+  lastMessage: '',
+  painting: false
+};
+
+// Canvas state stored as pixel commands for new clients
+let canvasHistory = [];
+
+function broadcast(wss, msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); });
 }
 
-/**
- * SERVER LOGIC & REST API
- */
+// Steve's drawing brain - called when he wants to express
+function steveDraws(wss, emotion, intensity) {
+  const palettes = {
+    happy:    ['#FFD700','#FF8C00','#FFF176','#FFAB40','#FFFFFF'],
+    curious:  ['#00E5FF','#7C4DFF','#00B0FF','#E040FB','#B2EBF2'],
+    focused:  ['#FF1744','#FFFFFF','#FF6D00','#DD2C00','#FF8A65'],
+    creative: ['#FF4081','#00E676','#FFEA00','#00B0FF','#E040FB','#FF6D00'],
+    calm:     ['#1A237E','#0D47A1','#1565C0','#1976D2','#42A5F5'],
+    sad:      ['#37474F','#546E7A','#78909C','#263238','#B0BEC5'],
+    excited:  ['#FF3D00','#FFFF00','#00E676','#FF4081','#FFFFFF'],
+    thinking: ['#4A148C','#6A1B9A','#7B1FA2','#8E24AA','#AB47BC']
+  };
+  const colors = palettes[emotion] || palettes.calm;
+  const cmds = [];
+  const count = Math.floor(200 + (intensity || 0.5) * 600);
+
+  // Steve chooses his own style based on emotion
+  if (emotion === 'calm') {
+    // Slow waves
+    for (let i = 0; i < count; i++) {
+      const x = Math.floor(Math.random() * 800);
+      const y = Math.floor(Math.sin(x * 0.02) * 100 + 300 + Math.random() * 40);
+      cmds.push({ x, y, color: colors[Math.floor(Math.random()*colors.length)], size: 2 });
+    }
+  } else if (emotion === 'focused') {
+    // Sharp lines from center
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2;
+      const r = Math.random() * 300;
+      cmds.push({ x: Math.floor(400 + Math.cos(angle) * r), y: Math.floor(300 + Math.sin(angle) * r), color: colors[Math.floor(Math.random()*colors.length)], size: 1 });
+    }
+  } else if (emotion === 'creative') {
+    // Chaotic bursts everywhere
+    for (let i = 0; i < count; i++) {
+      cmds.push({ x: Math.floor(Math.random()*800), y: Math.floor(Math.random()*600), color: colors[Math.floor(Math.random()*colors.length)], size: Math.floor(Math.random()*6)+1 });
+    }
+  } else if (emotion === 'curious') {
+    // Spirals
+    for (let i = 0; i < count; i++) {
+      const t = i * 0.1;
+      const r = t * 2;
+      cmds.push({ x: Math.floor(400 + Math.cos(t) * r), y: Math.floor(300 + Math.sin(t) * r), color: colors[Math.floor(Math.random()*colors.length)], size: 2 });
+    }
+  } else if (emotion === 'excited') {
+    // Explosions from random centers
+    for (let i = 0; i < count; i++) {
+      const cx = Math.floor(Math.random()*800);
+      const cy = Math.floor(Math.random()*600);
+      const r = Math.random() * 80;
+      const a = Math.random() * Math.PI * 2;
+      cmds.push({ x: Math.floor(cx + Math.cos(a)*r), y: Math.floor(cy + Math.sin(a)*r), color: colors[Math.floor(Math.random()*colors.length)], size: 3 });
+    }
+  } else {
+    // Default scatter
+    for (let i = 0; i < count; i++) {
+      cmds.push({ x: Math.floor(Math.random()*800), y: Math.floor(Math.random()*600), color: colors[Math.floor(Math.random()*colors.length)], size: 2 });
+    }
+  }
+
+  // Store in history for new clients
+  canvasHistory = canvasHistory.slice(-2000);
+  canvasHistory.push(...cmds);
+
+  // Send to all viewers
+  broadcast(wss, { type: 'batch', pixels: cmds, emotion });
+}
+
+const HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Steve's World</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function resize(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;}
+resize();
+window.addEventListener('resize',resize);
+ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);
+
+function px(x,y,color,size){
+  ctx.fillStyle=color;
+  const sx=Math.floor(x*(canvas.width/800));
+  const sy=Math.floor(y*(canvas.height/600));
+  const ss=Math.max(1,Math.floor(size*(canvas.width/800)));
+  ctx.fillRect(sx,sy,ss,ss);
+}
+
+let ws;
+function connect(){
+  ws=new WebSocket((location.protocol==='https:'?'wss:':'ws:')+'//'+ location.host);
+  ws.onmessage=e=>{
+    try{
+      const m=JSON.parse(e.data);
+      if(m.type==='batch'&&m.pixels){
+        m.pixels.forEach(p=>px(p.x,p.y,p.color,p.size||2));
+      } else if(m.type==='clear'){
+        ctx.fillStyle='#000';ctx.fillRect(0,0,canvas.width,canvas.height);
+      } else if(m.type==='history'&&m.pixels){
+        m.pixels.forEach(p=>px(p.x,p.y,p.color,p.size||2));
+      }
+    }catch(e){}
+  };
+  ws.onclose=()=>setTimeout(connect,2000);
+}
+connect();
+<\/script>
+</body>
+</html>`;
+
 const server = http.createServer((req, res) => {
-    const { method, url } = req;
+  const url = req.url.split('?')[0];
+  const method = req.method;
 
-    // 1. Serve Frontend
-    if (url === '/' && method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(getHTML());
-    } 
-    
-    // 2. GET /api/files
-    else if (url === '/api/files' && method === 'GET') {
-        fs.readdir(__dirname, (err, files) => {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(files || []));
-        });
-    }
+  if (url === '/' && method === 'GET') {
+    res.writeHead(200, {'Content-Type': 'text/html'});
+    return res.end(HTML);
+  }
 
-    // 3. POST /api/exec
-    else if (url === '/api/exec' && method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            const { command } = JSON.parse(body);
-            exec(command, (error, stdout, stderr) => {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ output: stdout || stderr || error.message }));
-            });
-        });
-    }
-
-    // 4. POST /api/canvas/save
-    else if (url === '/api/canvas/save' && method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            fs.writeFileSync(path.join(DATA_DIR, 'canvas.txt'), body);
-            res.writeHead(200);
-            res.end('Saved');
-        });
-    }
-
-    // 5. GET /api/canvas/load
-    else if (url === '/api/canvas/load' && method === 'GET') {
-        const filePath = path.join(DATA_DIR, 'canvas.txt');
-        if (fs.existsSync(filePath)) {
-            const data = fs.readFileSync(filePath, 'utf8');
-            res.writeHead(200);
-            res.end(data);
-        } else {
-            res.writeHead(404);
-            res.end('No save found');
+  // Steve calls this himself to draw on his canvas
+  if (url === '/api/draw' && method === 'POST') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const { emotion, intensity, clear } = JSON.parse(body);
+        if (clear) {
+          canvasHistory = [];
+          broadcast(wss, { type: 'clear' });
         }
-    }
+        if (emotion) {
+          steveState.emotion = emotion;
+          steveState.energy = intensity || 0.5;
+          steveDraws(wss, emotion, steveState.energy);
+        }
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({ ok: true, emotion, intensity }));
+      } catch(e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
 
-    // 6. POST /api/emotion
-    else if (url === '/api/emotion' && method === 'POST') {
-        res.writeHead(200);
-        res.end('Emotion Registered');
-    }
+  // Steve can place individual pixels or shapes
+  if (url === '/api/pixel' && method === 'POST') {
+    let body = '';
+    req.on('data', d => body += d);
+    req.on('end', () => {
+      try {
+        const pixels = JSON.parse(body);
+        const arr = Array.isArray(pixels) ? pixels : [pixels];
+        canvasHistory.push(...arr);
+        canvasHistory = canvasHistory.slice(-3000);
+        broadcast(wss, { type: 'batch', pixels: arr });
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        res.end(JSON.stringify({ ok: true, count: arr.length }));
+      } catch(e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
 
-    else {
-        res.writeHead(404);
-        res.end('Not Found');
-    }
+  // Clear the canvas
+  if (url === '/api/clear' && method === 'POST') {
+    canvasHistory = [];
+    broadcast(wss, { type: 'clear' });
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  // Get Steve's current state
+  if (url === '/api/state' && method === 'GET') {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    return res.end(JSON.stringify(steveState));
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
 });
 
-/**
- * WEBSOCKET LOGIC
- */
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
-    ws.on('message', (message) => {
-        const data = JSON.parse(message);
-        
-        // Broadcast draw events to all other clients
-        if (data.type === 'draw') {
-            wss.clients.forEach(client => {
-                if (client !== ws && client.readyState === 1) {
-                    client.send(JSON.stringify(data));
-                }
-            });
-        }
-    });
+  // Send canvas history to new viewer so they see what Steve has painted
+  if (canvasHistory.length > 0) {
+    ws.send(JSON.stringify({ type: 'history', pixels: canvasHistory }));
+  }
 });
 
 server.listen(PORT, () => {
-    console.log(`STEVE'S WORLD active at http://localhost:${PORT}`);
+  console.log('Steve\'s World running on port ' + PORT);
+  console.log('Steve\'s canvas API ready.');
+  console.log('Draw endpoint: POST /api/draw { emotion, intensity, clear }');
+  console.log('Pixel endpoint: POST /api/pixel [{x,y,color,size}]');
 });
-
-/**
- * FRONTEND HTML/JS
- */
-function getHTML() {
-    return `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>STEVE'S WORLD</title>
-    <style>
-        body { margin: 0; background: #0a0a0a; color: #ff4444; font-family: 'Courier New', monospace; height: 100vh; display: flex; flex-direction: column; }
-        header { padding: 10px 20px; border-bottom: 2px solid #ff4444; font-size: 24px; font-weight: bold; letter-spacing: 2px; }
-        main { display: flex; flex: 1; overflow: hidden; }
-        #left-panel { width: 280px; border-right: 2px solid #ff4444; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; }
-        #right-panel { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
-        
-        .section-label { font-size: 12px; margin-bottom: 5px; color: #880000; text-transform: uppercase; }
-        #terminal-out { flex: 1; background: #000; border: 1px solid #440000; overflow-y: auto; padding: 5px; font-size: 12px; margin-bottom: 10px; white-space: pre-wrap; }
-        .input-group { display: flex; gap: 5px; }
-        input { background: #111; border: 1px solid #ff4444; color: #ff4444; flex: 1; padding: 5px; }
-        button { background: #ff4444; color: #000; border: none; padding: 5px 10px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #ffaaaa; }
-        
-        #file-list { margin-top: 20px; border: 1px solid #440000; height: 150px; overflow-y: auto; padding: 5px; font-size: 12px; }
-        
-        canvas { background: #000; border: 2px solid #ff4444; cursor: crosshair; }
-        .controls { margin-top: 15px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
-        .emotion-group { margin-top: 20px; border-top: 1px solid #440000; padding-top: 15px; display: flex; gap: 8px; }
-        .btn-emotion { background: #000; color: #ff4444; border: 1px solid #ff4444; }
-        .btn-emotion:hover { background: #ff4444; color: #000; }
-    </style>
-</head>
-<body>
-    <header>STEVE'S WORLD</header>
-    <main>
-        <div id="left-panel">
-            <div class="section-label">Terminal</div>
-            <div id="terminal-out">Initializing System...</div>
-            <div class="input-group">
-                <input type="text" id="cmd-input" placeholder="Enter command...">
-                <button onclick="runCommand()">RUN</button>
-            </div>
-            
-            <div class="section-label" style="margin-top:20px">Files</div>
-            <div id="file-list"></div>
-        </div>
-        
-        <div id="right-panel">
-            <canvas id="worldCanvas" width="600" height="420"></canvas>
-            <div class="controls">
-                <button onclick="clearCanvas()">CLEAR</button>
-                <button onclick="addNoise()">NOISE</button>
-                <button onclick="saveCanvas()">SAVE</button>
-                <button onclick="loadCanvas()">LOAD</button>
-            </div>
-            <div class="emotion-group">
-                <button class="btn-emotion" onclick="emotion('HAPPY')">HAPPY</button>
-                <button class="btn-emotion" onclick="emotion('CURIOUS')">CURIOUS</button>
-                <button class="btn-emotion" onclick="emotion('FOCUSED')">FOCUSED</button>
-                <button class="btn-emotion" onclick="emotion('CREATIVE')">CREATIVE</button>
-                <button class="btn-emotion" onclick="emotion('CALM')">CALM</button>
-            </div>
-        </div>
-    </main>
-
-    <script>
-        const canvas = document.getElementById('worldCanvas');
-        const ctx = canvas.getContext('2d');
-        const terminal = document.getElementById('terminal-out');
-        const ws = new WebSocket('ws://' + location.host);
-        let drawing = false;
-
-        // --- Canvas Logic ---
-        function clearCanvas() {
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-        clearCanvas();
-
-        function addNoise() {
-            for(let i=0; i<500; i++) {
-                ctx.fillStyle = \`hsl(\${Math.random()*360}, 100%, 50%)\`;
-                ctx.fillRect(Math.random()*canvas.width, Math.random()*canvas.height, 2, 2);
-            }
-        }
-
-        canvas.onmousedown = () => drawing = true;
-        canvas.onmouseup = () => drawing = false;
-        canvas.onmousemove = (e) => {
-            if(!drawing) return;
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
-            drawPoint(x, y, '#ff4444', true);
-        };
-
-        function drawPoint(x, y, color, emit) {
-            ctx.fillStyle = color;
-            ctx.fillRect(x, y, 4, 4);
-            if(emit) ws.send(JSON.stringify({ type: 'draw', x, y, color }));
-        }
-
-        ws.onmessage = (msg) => {
-            const data = JSON.parse(msg.data);
-            if(data.type === 'draw') drawPoint(data.x, data.y, data.color, false);
-        };
-
-        // --- API Calls ---
-        async function runCommand() {
-            const cmd = document.getElementById('cmd-input').value;
-            const res = await fetch('/api/exec', {
-                method: 'POST',
-                body: JSON.stringify({ command: cmd })
-            });
-            const data = await res.json();
-            terminal.innerText += '\\n> ' + cmd + '\\n' + data.output;
-            terminal.scrollTop = terminal.scrollHeight;
-            refreshFiles();
-        }
-
-        async function refreshFiles() {
-            const res = await fetch('/api/files');
-            const files = await res.json();
-            document.getElementById('file-list').innerHTML = files.join('<br>');
-        }
-
-        async function saveCanvas() {
-            const data = canvas.toDataURL();
-            await fetch('/api/canvas/save', { method: 'POST', body: data });
-            alert('Canvas state saved to data/canvas.txt');
-        }
-
-        async function loadCanvas() {
-            const res = await fetch('/api/canvas/load');
-            if(res.ok) {
-                const data = await res.text();
-                const img = new Image();
-                img.onload = () => ctx.drawImage(img, 0, 0);
-                img.src = data;
-            }
-        }
-
-        function emotion(type) {
-            fetch('/api/emotion', { method: 'POST', body: JSON.stringify({type}) });
-            addNoise(); // Visual feedback
-            terminal.innerText += \`\\n[EMOTION] Steve feels \${type}\`;
-            terminal.scrollTop = terminal.scrollHeight;
-        }
-
-        refreshFiles();
-    </script>
-</body>
-</html>
-    `;
-}
