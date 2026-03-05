@@ -1,18 +1,16 @@
 {
   "name": "steve-world",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Steve's pixel canvas world",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
-    "@hono/node-server": "^1.19.11",
-    "hono": "^4.12.5",
     "ws": "^8.19.0"
   }
 }
